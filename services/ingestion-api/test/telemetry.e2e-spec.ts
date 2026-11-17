@@ -1,4 +1,5 @@
 import { INestApplication } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { Test } from '@nestjs/testing';
 import { MongoMemoryServer } from 'mongodb-memory-server';
@@ -22,7 +23,8 @@ describe('Telemetry API (e2e)', () => {
     deviceId: 'vehicle-001',
     recordedAt: '2026-11-17T09:30:00.000Z',
     readings: [
-      { offsetMs: 1000, lat: 52.5209, lng: 13.405, speedMps: 10 },
+      // ~10 m in one second: realistic, so the fixture raises no alerts.
+      { offsetMs: 1000, lat: 52.52009, lng: 13.405, speedMps: 10 },
       { offsetMs: 0, lat: 52.52, lng: 13.405, speedMps: 6 },
     ],
     ...overrides,
@@ -31,7 +33,11 @@ describe('Telemetry API (e2e)', () => {
   beforeAll(async () => {
     mongo = await MongoMemoryServer.create();
     const moduleRef = await Test.createTestingModule({
-      imports: [MongooseModule.forRoot(mongo.getUri('wayline-test')), TelemetryModule],
+      imports: [
+        ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true }),
+        MongooseModule.forRoot(mongo.getUri('wayline-test')),
+        TelemetryModule,
+      ],
     }).compile();
 
     app = moduleRef.createNestApplication();
@@ -46,7 +52,7 @@ describe('Telemetry API (e2e)', () => {
 
   it('stores a batch with computed route stats and sorted readings', async () => {
     const created = await http().post('/api/v1/telemetry').send(batch()).expect(201);
-    expect(created.body).toEqual({ id: expect.any(String), status: 'created' });
+    expect(created.body).toEqual({ id: expect.any(String), status: 'created', alerts: 0 });
 
     const fetched = await http().get(`/api/v1/telemetry/${created.body.id}`).expect(200);
     expect(fetched.body.readings.map((r: { offsetMs: number }) => r.offsetMs)).toEqual([0, 1000]);
@@ -56,7 +62,7 @@ describe('Telemetry API (e2e)', () => {
       maxSpeedMps: 10,
       avgSpeedMps: 8,
     });
-    expect(fetched.body.stats.distanceMeters).toBeCloseTo(100.08, 0);
+    expect(fetched.body.stats.distanceMeters).toBeCloseTo(10.01, 1);
   });
 
   it('is idempotent on messageId', async () => {
@@ -64,7 +70,7 @@ describe('Telemetry API (e2e)', () => {
     const first = await http().post('/api/v1/telemetry').send(payload).expect(201);
     const second = await http().post('/api/v1/telemetry').send(payload).expect(200);
 
-    expect(second.body).toEqual({ id: first.body.id, status: 'duplicate' });
+    expect(second.body).toEqual({ id: first.body.id, status: 'duplicate', alerts: 0 });
   });
 
   it.each([
@@ -120,7 +126,10 @@ describe('Telemetry API (e2e)', () => {
       batchCount: 3,
       lastSeenAt: '2026-11-18T10:03:00.000Z',
       maxSpeedMps: 10,
-      lastPosition: { lat: 52.5209, lng: 13.405 },
+      lastPosition: { lat: 52.52009, lng: 13.405 },
+      lastSpeedMps: 10,
+      // Seeded with 2026 timestamps far from "now" in the test run.
+      status: expect.stringMatching(/^(online|stale)$/),
     });
   });
 
@@ -131,5 +140,58 @@ describe('Telemetry API (e2e)', () => {
     const created = await http().post('/api/v1/telemetry').send(batch()).expect(201);
     await http().delete(`/api/v1/telemetry/${created.body.id}`).expect(204);
     await http().get(`/api/v1/telemetry/${created.body.id}`).expect(404);
+  });
+
+  describe('alerts', () => {
+    const speeding = (messageId: string) =>
+      batch({
+        messageId,
+        deviceId: 'speedy-1',
+        recordedAt: '2026-11-18T12:00:00.000Z',
+        readings: [
+          { offsetMs: 0, lat: 52.52, lng: 13.405, speedMps: 20 },
+          { offsetMs: 1000, lat: 52.5203, lng: 13.405, speedMps: 38 },
+          { offsetMs: 2000, lat: 52.5206, lng: 13.405, speedMps: 41 },
+          { offsetMs: 3000, lat: 52.5209, lng: 13.405, speedMps: 25 },
+          // ~1.1 km in one second: a GPS jump.
+          { offsetMs: 4000, lat: 52.5309, lng: 13.405, speedMps: 25 },
+        ],
+      });
+
+    it('raises one alert per anomaly when a batch is ingested', async () => {
+      const res = await http().post('/api/v1/telemetry').send(speeding('alerts-1')).expect(201);
+      expect(res.body.alerts).toBe(2);
+
+      const alerts = await http().get('/api/v1/alerts').query({ deviceId: 'speedy-1' }).expect(200);
+      expect(alerts.body.total).toBe(2);
+
+      const byType = Object.fromEntries(
+        alerts.body.items.map((a: { type: string }) => [a.type, a]),
+      );
+      expect(byType.overspeed).toMatchObject({
+        value: 41,
+        threshold: 33.3,
+        detectedAt: '2026-11-18T12:00:02.000Z',
+        position: { lat: 52.5206, lng: 13.405 },
+      });
+      expect(byType.gps_jump).toMatchObject({ detectedAt: '2026-11-18T12:00:04.000Z' });
+      expect(byType.gps_jump.value).toBeGreaterThan(1000);
+    });
+
+    it('does not duplicate alerts when the batch is replayed', async () => {
+      await http().post('/api/v1/telemetry').send(speeding('alerts-1')).expect(200);
+      const alerts = await http().get('/api/v1/alerts').query({ deviceId: 'speedy-1' }).expect(200);
+      expect(alerts.body.total).toBe(2);
+    });
+
+    it('filters alerts by type and validates the filter', async () => {
+      const jumps = await http()
+        .get('/api/v1/alerts')
+        .query({ deviceId: 'speedy-1', type: 'gps_jump' })
+        .expect(200);
+      expect(jumps.body.total).toBe(1);
+
+      await http().get('/api/v1/alerts').query({ type: 'meteor' }).expect(400);
+    });
   });
 });

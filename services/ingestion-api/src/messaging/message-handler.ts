@@ -17,7 +17,30 @@ export type Disposition =
 
 export type Ingest = (dto: IngestTelemetryDto) => Promise<IngestResult>;
 
-export async function decideDisposition(content: Buffer, ingest: Ingest): Promise<Disposition> {
+export interface DeliveryContext {
+  /**
+   * Device the transport says sent the message (from the MQTT topic). When set,
+   * the payload must claim the same device, so one device cannot write
+   * telemetry for another by changing the body.
+   */
+  topicDeviceId?: string;
+}
+
+/**
+ * Extracts the device id from an MQTT-originated routing key
+ * (`devices.<id>.telemetry`). The MQTT plugin turns "." in a topic into "/",
+ * so it is turned back here. Returns undefined for any other routing key.
+ */
+export function deviceIdFromMqttRoutingKey(routingKey: string): string | undefined {
+  const match = /^devices\.([^.]+)\.telemetry$/.exec(routingKey);
+  return match ? match[1].replace(/\//g, '.') : undefined;
+}
+
+export async function decideDisposition(
+  content: Buffer,
+  ingest: Ingest,
+  context: DeliveryContext = {},
+): Promise<Disposition> {
   let payload: unknown;
   try {
     payload = JSON.parse(content.toString('utf8'));
@@ -33,6 +56,13 @@ export async function decideDisposition(content: Buffer, ingest: Ingest): Promis
   const errors = await validate(dto, { whitelist: true, forbidNonWhitelisted: true });
   if (errors.length > 0) {
     return { action: 'reject', reason: `validation failed: ${describe(errors)}` };
+  }
+
+  if (context.topicDeviceId !== undefined && context.topicDeviceId !== dto.deviceId) {
+    return {
+      action: 'reject',
+      reason: `deviceId "${dto.deviceId}" does not match topic device "${context.topicDeviceId}"`,
+    };
   }
 
   try {

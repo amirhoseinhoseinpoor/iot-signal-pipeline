@@ -21,8 +21,10 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672" # management UI
+      - "1883:1883" # MQTT
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -37,6 +39,8 @@ services:
       MONGO_URI: mongodb://mongo:27017/wayline
       AMQP_URL: amqp://${RABBITMQ_USER:-wayline}:${RABBITMQ_PASSWORD:-wayline}@rabbitmq:5672
       AMQP_PREFETCH: 20
+      OVERSPEED_LIMIT_MPS: ${OVERSPEED_LIMIT_MPS:-33.3}
+      DEVICE_STALE_AFTER_SECONDS: ${DEVICE_STALE_AFTER_SECONDS:-60}
     depends_on:
       mongo:
         condition: service_healthy
@@ -48,6 +52,9 @@ services:
     build: ./services/device-simulator
     environment:
       AMQP_URL: amqp://${RABBITMQ_USER:-wayline}:${RABBITMQ_PASSWORD:-wayline}@rabbitmq:5672
+      MQTT_URL: mqtt://${RABBITMQ_USER:-wayline}:${RABBITMQ_PASSWORD:-wayline}@rabbitmq:1883
+      TRANSPORT: ${TRANSPORT:-mixed}
+      ANOMALY_RATE: ${ANOMALY_RATE:-0.05}
       DEVICE_COUNT: ${DEVICE_COUNT:-5}
       PUBLISH_INTERVAL_MS: ${PUBLISH_INTERVAL_MS:-5000}
     depends_on:

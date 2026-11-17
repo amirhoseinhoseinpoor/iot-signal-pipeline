@@ -1,9 +1,14 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { FilterQuery, isValidObjectId, Model } from 'mongoose';
-import { computeRouteStats, sortReadings } from './domain/route-stats';
+import { AlertsService } from './alerts.service';
+import { DETECTION_RULES, DEVICE_STALE_AFTER_MS } from './detection-rules.provider';
+import { detectAnomalies } from './domain/anomalies';
+import type { DetectionRules } from './domain/anomalies';
+import { computeRouteStats, Reading, sortReadings } from './domain/route-stats';
 import { IngestTelemetryDto } from './dto/ingest-telemetry.dto';
 import { ListTelemetryQuery } from './dto/list-telemetry.query';
+import { LiveEvents } from './live-events';
 import { TelemetryBatch } from './telemetry-batch.schema';
 
 export type IngestStatus = 'created' | 'duplicate';
@@ -11,6 +16,8 @@ export type IngestStatus = 'created' | 'duplicate';
 export interface IngestResult {
   id: string;
   status: IngestStatus;
+  /** Number of anomalies found in the batch. */
+  alerts: number;
 }
 
 export interface Page<T> {
@@ -27,6 +34,9 @@ export interface DeviceSummary {
   totalDistanceMeters: number;
   maxSpeedMps: number;
   lastPosition: { lat: number; lng: number } | null;
+  lastSpeedMps: number | null;
+  /** `stale` when nothing arrived within DEVICE_STALE_AFTER_SECONDS. */
+  status: 'online' | 'stale';
 }
 
 const DUPLICATE_KEY_ERROR = 11000;
@@ -38,6 +48,10 @@ export class TelemetryService {
   constructor(
     @InjectModel(TelemetryBatch.name)
     private readonly batches: Model<TelemetryBatch>,
+    private readonly alerts: AlertsService,
+    private readonly events: LiveEvents,
+    @Inject(DETECTION_RULES) private readonly rules: DetectionRules,
+    @Inject(DEVICE_STALE_AFTER_MS) private readonly staleAfterMs: number,
   ) {}
 
   /**
@@ -51,18 +65,21 @@ export class TelemetryService {
       lng,
       speedMps,
     }));
+    const stats = computeRouteStats(readings);
+    const anomalies = detectAnomalies(readings, this.rules);
 
+    let result: IngestResult;
     try {
       const created = await this.batches.create({
         messageId: dto.messageId,
         deviceId: dto.deviceId,
         recordedAt: dto.recordedAt,
         readings,
-        stats: computeRouteStats(readings),
+        stats,
         payloadBytes: Buffer.byteLength(JSON.stringify(readings)),
       });
       this.logger.debug(`Stored batch ${dto.messageId} from ${dto.deviceId}`);
-      return { id: created.id as string, status: 'created' };
+      result = { id: created.id as string, status: 'created', alerts: anomalies.length };
     } catch (error) {
       if (!isDuplicateKeyError(error)) throw error;
 
@@ -72,8 +89,47 @@ export class TelemetryService {
         .exec();
       if (!existing) throw error;
       this.logger.log(`Ignored replayed batch ${dto.messageId}`);
-      return { id: String(existing._id), status: 'duplicate' };
+      result = { id: String(existing._id), status: 'duplicate', alerts: anomalies.length };
     }
+
+    // Runs for replays too: if a previous attempt crashed after storing the batch
+    // but before storing its alerts, the replay completes the job. Only alerts
+    // that are actually new are returned, so nothing is announced twice.
+    const newAlerts = await this.alerts.recordForBatch(dto, anomalies);
+
+    if (result.status === 'created') this.publishPosition(dto, readings, stats.distanceMeters);
+    for (const alert of newAlerts) {
+      this.events.publish({
+        type: 'alert',
+        id: String(alert._id),
+        deviceId: alert.deviceId,
+        alertType: alert.type,
+        at: alert.detectedAt.toISOString(),
+        lat: alert.position.lat,
+        lng: alert.position.lng,
+        value: alert.value,
+        threshold: alert.threshold,
+      });
+    }
+
+    return result;
+  }
+
+  private publishPosition(
+    dto: IngestTelemetryDto,
+    readings: Reading[],
+    distanceMeters: number,
+  ): void {
+    const last = readings[readings.length - 1];
+    this.events.publish({
+      type: 'position',
+      deviceId: dto.deviceId,
+      at: new Date(dto.recordedAt.getTime() + last.offsetMs).toISOString(),
+      lat: last.lat,
+      lng: last.lng,
+      speedMps: last.speedMps,
+      distanceMeters,
+    });
   }
 
   async list(query: ListTelemetryQuery): Promise<Page<Omit<TelemetryBatch, 'readings'>>> {
@@ -114,9 +170,9 @@ export class TelemetryService {
   }
 
   /** One row per device: activity totals and the most recent known position. */
-  async listDevices(): Promise<DeviceSummary[]> {
-    return this.batches
-      .aggregate<DeviceSummary>([
+  async listDevices(now = new Date()): Promise<DeviceSummary[]> {
+    const rows = await this.batches
+      .aggregate<Omit<DeviceSummary, 'status'>>([
         { $sort: { recordedAt: -1 } },
         {
           $group: {
@@ -143,11 +199,17 @@ export class TelemetryService {
                 null,
               ],
             },
+            lastSpeedMps: { $ifNull: ['$lastReading.speedMps', null] },
           },
         },
         { $sort: { deviceId: 1 } },
       ])
       .exec();
+
+    return rows.map((row) => ({
+      ...row,
+      status: now.getTime() - row.lastSeenAt.getTime() > this.staleAfterMs ? 'stale' : 'online',
+    }));
   }
 }
 

@@ -17,6 +17,16 @@ export const DELIVERY_LIMIT = 5;
 
 export const routingKeyFor = (deviceId: string) => `device.${deviceId}`;
 
+/**
+ * Devices can also publish over MQTT to `devices/<deviceId>/telemetry`.
+ * RabbitMQ's MQTT plugin forwards those messages to `amq.topic`, swapping
+ * "/" and "." in the topic, so the routing key becomes
+ * `devices.<deviceId with "." as "/">.telemetry`.
+ */
+export const MQTT_EXCHANGE = 'amq.topic';
+export const MQTT_ROUTING_PATTERN = 'devices.*.telemetry';
+export const mqttTopicFor = (deviceId: string) => `devices/${deviceId}/telemetry`;
+
 export async function assertTopology(channel: Channel): Promise<void> {
   await channel.assertExchange(TELEMETRY_EXCHANGE, 'topic', { durable: true });
   await channel.assertExchange(DEAD_LETTER_EXCHANGE, 'fanout', { durable: true });
@@ -35,4 +45,6 @@ export async function assertTopology(channel: Channel): Promise<void> {
     },
   });
   await channel.bindQueue(TELEMETRY_QUEUE, TELEMETRY_EXCHANGE, 'device.#');
+  // amq.topic always exists; the binding is harmless when the MQTT plugin is off.
+  await channel.bindQueue(TELEMETRY_QUEUE, MQTT_EXCHANGE, MQTT_ROUTING_PATTERN);
 }

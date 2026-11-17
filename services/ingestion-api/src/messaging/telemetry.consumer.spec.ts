@@ -55,3 +55,34 @@ describe('TelemetryConsumer.handle', () => {
     expect(channel.ack).not.toHaveBeenCalled();
   });
 });
+
+describe('TelemetryConsumer.handle (MQTT)', () => {
+  const channel = { ack: jest.fn(), nack: jest.fn() };
+  const ingest = jest.fn();
+  const consumer = new TelemetryConsumer(
+    {} as AmqpConnectionManager,
+    { ingest } as unknown as TelemetryService,
+    {} as ConfigService,
+  );
+  const fromTopic = (routingKey: string) => {
+    const msg = message(valid);
+    (msg as { fields: unknown }).fields = { exchange: 'amq.topic', routingKey };
+    return msg;
+  };
+
+  beforeEach(() => jest.resetAllMocks());
+
+  it('acks when the topic device matches the payload', async () => {
+    ingest.mockResolvedValue({ id: 'x', status: 'created', alerts: 0 });
+    const msg = fromTopic('devices.vehicle-001.telemetry');
+    await consumer.handle(channel, msg);
+    expect(channel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('dead-letters a payload that claims another device', async () => {
+    const msg = fromTopic('devices.vehicle-002.telemetry');
+    await consumer.handle(channel, msg);
+    expect(channel.nack).toHaveBeenCalledWith(msg, false, false);
+    expect(ingest).not.toHaveBeenCalled();
+  });
+});

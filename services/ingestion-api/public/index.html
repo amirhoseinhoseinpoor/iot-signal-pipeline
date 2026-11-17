@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wayline · Fleet live</title>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"
+      crossorigin="anonymous"
+    />
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --text: #18202b;
+        --muted: #5d6a7a;
+        --border: #e2e6ec;
+        --accent: #2563eb;
+        --online: #16a34a;
+        --stale: #9aa4b2;
+        --overspeed: #ea580c;
+        --gps-jump: #c026d3;
+        --radius: 10px;
+        font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f141b;
+          --panel: #161d27;
+          --text: #e6ebf2;
+          --muted: #93a1b3;
+          --border: #263142;
+          --accent: #60a5fa;
+          --stale: #5b6778;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+      body { display: grid; grid-template-rows: auto 1fr; }
+      header {
+        display: flex; align-items: center; gap: 12px; justify-content: space-between;
+        padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+      }
+      .brand { display: flex; align-items: baseline; gap: 10px; }
+      .brand h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+      .brand span { color: var(--muted); font-size: 13px; }
+      .pill {
+        display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px;
+        border: 1px solid var(--border); border-radius: 999px; color: var(--muted);
+      }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--stale); flex: none; }
+      .dot.online { background: var(--online); }
+      main { display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
+      #map { min-height: 300px; }
+      aside {
+        display: grid; grid-template-rows: auto auto 1fr; min-height: 0; overflow: hidden;
+        border-inline-start: 1px solid var(--border); background: var(--panel);
+      }
+      .stats { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--border); }
+      .stat { padding: 12px 14px; }
+      .stat + .stat { border-inline-start: 1px solid var(--border); }
+      .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+      .stat small { color: var(--muted); font-size: 12px; }
+      section { min-height: 0; overflow: auto; }
+      section h2 {
+        position: sticky; top: 0; margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+        background: var(--panel); border-bottom: 1px solid var(--border);
+      }
+      #devices { max-height: 40vh; border-bottom: 1px solid var(--border); }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li.device {
+        display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center;
+        padding: 9px 14px; cursor: pointer; border-bottom: 1px solid var(--border);
+      }
+      li.device:hover, li.device:focus-visible { background: color-mix(in srgb, var(--accent) 8%, transparent); outline: none; }
+      li.device .name { font-weight: 600; font-size: 14px; }
+      li.device .meta, li.alert .meta { color: var(--muted); font-size: 12px; }
+      li.device .speed { font-variant-numeric: tabular-nums; font-size: 13px; text-align: end; }
+      li.alert { display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); }
+      li.alert.fresh { animation: flash 1.6s ease-out; }
+      @keyframes flash { from { background: color-mix(in srgb, var(--overspeed) 18%, transparent); } }
+      .badge { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 6px; color: #fff; align-self: start; }
+      .badge.overspeed { background: var(--overspeed); }
+      .badge.gps_jump { background: var(--gps-jump); }
+      .empty { padding: 14px; color: var(--muted); font-size: 13px; }
+      @media (max-width: 800px) {
+        main { grid-template-columns: 1fr; grid-template-rows: 55vh auto; }
+        aside { border-inline-start: 0; border-top: 1px solid var(--border); }
+        #devices { max-height: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <h1>Wayline</h1>
+        <span>Fleet live</span>
+      </div>
+      <span class="pill" id="connection"><span class="dot"></span><span>Connecting…</span></span>
+    </header>
+    <main>
+      <div id="map" role="region" aria-label="Fleet map"></div>
+      <aside>
+        <div class="stats">
+          <div class="stat"><b id="stat-online">0</b><small>online</small></div>
+          <div class="stat"><b id="stat-devices">0</b><small>devices</small></div>
+          <div class="stat"><b id="stat-alerts">0</b><small>alerts (live)</small></div>
+        </div>
+        <section id="devices" aria-label="Devices">
+          <h2>Devices</h2>
+          <ul id="device-list"><li class="empty">Waiting for the first batch…</li></ul>
+        </section>
+        <section aria-label="Alerts">
+          <h2>Alerts</h2>
+          <ul id="alert-list"><li class="empty">No alerts yet.</li></ul>
+        </section>
+      </aside>
+    </main>
+
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"
+      crossorigin="anonymous"
+    ></script>
+    <script>
+      'use strict';
+      const API = '/api/v1';
+      const TRAIL_POINTS = 60;
+      const STALE_AFTER_MS = 60_000;
+      const MAX_ALERTS = 50;
+
+      const map = L.map('map', { zoomControl: true }).setView([52.52, 13.405], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map);
+      // Leaflet measures its container once; re-measure whenever the grid layout changes it.
+      new ResizeObserver(() => map.invalidateSize()).observe(document.getElementById('map'));
+
+      /** deviceId -> { marker, trail, lastSeen, speedMps, distanceMeters } */
+      const devices = new Map();
+      let liveAlerts = 0;
+      let fitted = false;
+
+      const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+      const kmh = (mps) => (mps == null ? '–' : `${Math.round(mps * 3.6)} km/h`);
+      const km = (m) => `${(m / 1000).toFixed(1)} km`;
+      const ago = (date) => {
+        const s = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+        return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`;
+      };
+      const isOnline = (d) => Date.now() - d.lastSeen.getTime() < STALE_AFTER_MS;
+
+      function markerFor(deviceId) {
+        const marker = L.circleMarker([0, 0], { radius: 7, weight: 2, color: '#fff', fillColor: '#2563eb', fillOpacity: 1 });
+        marker.bindTooltip(esc(deviceId));
+        return marker;
+      }
+
+      function upsertDevice({ deviceId, lat, lng, at, speedMps, distanceMeters = 0 }) {
+        let d = devices.get(deviceId);
+        if (!d) {
+          d = {
+            marker: markerFor(deviceId).addTo(map),
+            trail: L.polyline([], { weight: 3, opacity: 0.55, color: '#2563eb' }).addTo(map),
+            distanceMeters: 0,
+          };
+          devices.set(deviceId, d);
+        }
+        d.marker.setLatLng([lat, lng]);
+        const points = d.trail.getLatLngs();
+        points.push([lat, lng]);
+        if (points.length > TRAIL_POINTS) points.shift();
+        d.trail.setLatLngs(points);
+        d.lastSeen = new Date(at);
+        d.speedMps = speedMps;
+        d.distanceMeters += distanceMeters;
+      }
+
+      function renderDevices() {
+        const list = document.getElementById('device-list');
+        const rows = [...devices.entries()].sort(([a], [b]) => a.localeCompare(b));
+        document.getElementById('stat-devices').textContent = rows.length;
+        document.getElementById('stat-online').textContent = rows.filter(([, d]) => isOnline(d)).length;
+        if (rows.length === 0) return;
+        list.innerHTML = rows
+          .map(([id, d]) => `
+            <li class="device" tabindex="0" data-id="${esc(id)}">
+              <span class="dot ${isOnline(d) ? 'online' : ''}" title="${isOnline(d) ? 'online' : 'stale'}"></span>
+              <span><span class="name">${esc(id)}</span><br /><span class="meta">${km(d.distanceMeters)} · ${ago(d.lastSeen)}</span></span>
+              <span class="speed">${kmh(d.speedMps)}</span>
+            </li>`)
+          .join('');
+        for (const [, d] of rows) d.marker.setStyle({ fillColor: isOnline(d) ? '#2563eb' : '#9aa4b2' });
+      }
+
+      function addAlert(alert, fresh) {
+        const list = document.getElementById('alert-list');
+        list.querySelector('.empty')?.remove();
+        const label = alert.alertType === 'overspeed' ? 'Overspeed' : 'GPS jump';
+        const detail = alert.alertType === 'overspeed'
+          ? `${kmh(alert.value)} (limit ${kmh(alert.threshold)})`
+          : alert.value == null ? 'position jumped instantly' : `implied ${kmh(alert.value)}`;
+        const li = document.createElement('li');
+        li.className = `alert${fresh ? ' fresh' : ''}`;
+        li.innerHTML = `
+          <span class="badge ${esc(alert.alertType)}">${label}</span>
+          <span><b>${esc(alert.deviceId)}</b><br /><span class="meta">${esc(detail)} · ${new Date(alert.at).toLocaleTimeString()}</span></span>`;
+        li.addEventListener('click', () => map.setView([alert.lat, alert.lng], 16));
+        list.prepend(li);
+        while (list.children.length > MAX_ALERTS) list.lastElementChild.remove();
+
+        const color = alert.alertType === 'overspeed' ? '#ea580c' : '#c026d3';
+        L.circleMarker([alert.lat, alert.lng], { radius: 5, color, fillColor: color, fillOpacity: 0.7, weight: 1 })
+          .bindTooltip(`${label} · ${esc(alert.deviceId)}`)
+          .addTo(map);
+      }
+
+      function setConnection(online, text) {
+        const pill = document.getElementById('connection');
+        pill.querySelector('.dot').classList.toggle('online', online);
+        pill.lastElementChild.textContent = text;
+      }
+
+      document.getElementById('device-list').addEventListener('click', (e) => {
+        const id = e.target.closest('li.device')?.dataset.id;
+        const d = id && devices.get(id);
+        if (d) map.setView(d.marker.getLatLng(), 16);
+      });
+      document.getElementById('device-list').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') e.target.click();
+      });
+
+      async function loadInitialState() {
+        const [deviceRows, alertPage] = await Promise.all([
+          fetch(`${API}/devices`).then((r) => r.json()),
+          fetch(`${API}/alerts?limit=20`).then((r) => r.json()),
+        ]);
+        for (const row of deviceRows) {
+          if (!row.lastPosition) continue;
+          upsertDevice({
+            deviceId: row.deviceId,
+            lat: row.lastPosition.lat,
+            lng: row.lastPosition.lng,
+            at: row.lastSeenAt,
+            speedMps: row.lastSpeedMps,
+            distanceMeters: row.totalDistanceMeters,
+          });
+        }
+        for (const a of alertPage.items.slice().reverse()) {
+          addAlert({ deviceId: a.deviceId, alertType: a.type, at: a.detectedAt, lat: a.position.lat, lng: a.position.lng, value: a.value, threshold: a.threshold }, false);
+        }
+        fitToFleet();
+        renderDevices();
+      }
+
+      function fitToFleet() {
+        const points = [...devices.values()].map((d) => d.marker.getLatLng());
+        if (points.length === 0) return;
+        map.fitBounds(L.latLngBounds(points).pad(0.3), { maxZoom: 15 });
+        fitted = true;
+      }
+
+      function connect() {
+        const source = new EventSource(`${API}/stream`);
+        source.onopen = () => setConnection(true, 'Live');
+        source.onerror = () => setConnection(false, 'Reconnecting…');
+        source.addEventListener('position', (e) => {
+          upsertDevice(JSON.parse(e.data));
+          if (!fitted) fitToFleet();
+          renderDevices();
+        });
+        source.addEventListener('alert', (e) => {
+          liveAlerts++;
+          document.getElementById('stat-alerts').textContent = liveAlerts;
+          addAlert(JSON.parse(e.data), true);
+        });
+      }
+
+      loadInitialState()
+        .catch((err) => console.error('Could not load initial state', err))
+        .finally(connect);
+      setInterval(renderDevices, 5000);
+    </script>
+  </body>
+</html>

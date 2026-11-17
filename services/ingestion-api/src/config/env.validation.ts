@@ -1,5 +1,5 @@
 import { plainToInstance, Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Max, Min, validateSync } from 'class-validator';
+import { IsInt, IsNumber, IsOptional, IsString, Max, Min, validateSync } from 'class-validator';
 
 export class Environment {
   @IsString()
@@ -22,6 +22,27 @@ export class Environment {
   @Min(1)
   @Max(1000)
   AMQP_PREFETCH: number = 20;
+
+  /** Reported speed that raises an `overspeed` alert (default 33.3 m/s, 120 km/h). */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  OVERSPEED_LIMIT_MPS: number = 33.3;
+
+  /** Implied speed between two positions that raises a `gps_jump` alert. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  MAX_IMPLIED_SPEED_MPS: number = 70;
+
+  /** A device with no data for this long is reported as `stale`. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  DEVICE_STALE_AFTER_SECONDS: number = 60;
 }
 
 /** Fails fast at startup with every missing or malformed variable listed. */

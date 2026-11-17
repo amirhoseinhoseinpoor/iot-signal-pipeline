@@ -10,8 +10,8 @@ import type { AmqpConnectionManager, ChannelWrapper } from 'amqp-connection-mana
 import type { Channel, ConsumeMessage } from 'amqplib';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { AMQP_CONNECTION } from './amqp-connection.provider';
-import { decideDisposition } from './message-handler';
-import { assertTopology, TELEMETRY_QUEUE } from './topology';
+import { decideDisposition, deviceIdFromMqttRoutingKey } from './message-handler';
+import { assertTopology, MQTT_EXCHANGE, TELEMETRY_QUEUE } from './topology';
 
 /**
  * Consumes telemetry batches from RabbitMQ.
@@ -49,7 +49,12 @@ export class TelemetryConsumer implements OnApplicationBootstrap, OnApplicationS
   }
 
   async handle(channel: Pick<Channel, 'ack' | 'nack'>, msg: ConsumeMessage): Promise<void> {
-    const disposition = await decideDisposition(msg.content, (dto) => this.telemetry.ingest(dto));
+    const fromMqtt = msg.fields.exchange === MQTT_EXCHANGE;
+    const disposition = await decideDisposition(
+      msg.content,
+      (dto) => this.telemetry.ingest(dto),
+      fromMqtt ? { topicDeviceId: deviceIdFromMqttRoutingKey(msg.fields.routingKey) ?? '' } : {},
+    );
     const id = (msg.properties.messageId as string | undefined) ?? 'unknown';
 
     switch (disposition.action) {

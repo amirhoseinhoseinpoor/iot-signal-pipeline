@@ -1,112 +1,112 @@
-import {
-  Inject,
-  Injectable,
-  Logger,
-  OnApplicationBootstrap,
-  OnApplicationShutdown,
-} from '@nestjs/common';
-import { AmqpConnectionManager, ChannelWrapper, connect } from 'amqp-connection-manager';
-import type { Channel } from 'amqplib';
+import { Logger, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { injectAnomaly, maybeAnomaly } from './anomaly-injector';
+import { transportFor } from './config';
 import type { SimulatorConfig } from './config';
-import { assertTopology, routingKeyFor, TELEMETRY_EXCHANGE } from './topology';
+import { AmqpPublisher, MqttPublisher } from './publishers';
+import type { TelemetryMessage, TelemetryPublisher } from './publishers';
 import { SimulatedVehicle } from './vehicle';
+import type { Random } from './vehicle';
 
 export const SIMULATOR_CONFIG = Symbol('SIMULATOR_CONFIG');
+export const PUBLISHER_FACTORY = Symbol('PUBLISHER_FACTORY');
 
-export interface TelemetryMessage {
-  messageId: string;
-  deviceId: string;
-  recordedAt: string;
-  readings: ReturnType<SimulatedVehicle['sampleBatch']>;
-}
+export type PublisherFactory = (
+  transport: 'amqp' | 'mqtt',
+  config: SimulatorConfig,
+) => TelemetryPublisher;
+
+export const defaultPublisherFactory: PublisherFactory = (transport, config) =>
+  transport === 'amqp'
+    ? new AmqpPublisher(config.amqpUrl)
+    : new MqttPublisher(config.mqttUrl, `wayline-simulator-${process.pid}`);
 
 /**
  * Drives a small fleet of simulated vehicles and publishes one telemetry batch
- * per vehicle per interval. Publishing uses confirm channels, so a batch counts
- * as sent only once the broker has accepted it; while the broker is away,
- * amqp-connection-manager buffers messages and reconnects.
+ * per vehicle per interval, over AMQP, MQTT or both. A small share of batches
+ * carry injected anomalies so the detection pipeline has something to find.
+ *
+ * Built by a factory provider (see AppModule) so tests can inject the
+ * publishers and the random source directly.
  */
-@Injectable()
 export class SimulatorService implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger(SimulatorService.name);
   private readonly vehicles: SimulatedVehicle[];
-  private connection?: AmqpConnectionManager;
-  private channel?: ChannelWrapper;
+  private readonly publishers = new Map<'amqp' | 'mqtt', TelemetryPublisher>();
   private timer?: NodeJS.Timeout;
 
-  constructor(@Inject(SIMULATOR_CONFIG) private readonly config: SimulatorConfig) {
+  constructor(
+    private readonly config: SimulatorConfig,
+    private readonly createPublisher: PublisherFactory,
+    private readonly random: Random = Math.random,
+  ) {
     this.vehicles = Array.from({ length: config.deviceCount }, (_, i) => {
       const deviceId = `vehicle-${String(i + 1).padStart(3, '0')}`;
       return new SimulatedVehicle(deviceId, {
-        lat: config.originLat + (Math.random() - 0.5) * 0.04,
-        lng: config.originLng + (Math.random() - 0.5) * 0.06,
-        headingDeg: Math.random() * 360,
-        speedMps: 5 + Math.random() * 10,
+        lat: config.originLat + (this.random() - 0.5) * 0.04,
+        lng: config.originLng + (this.random() - 0.5) * 0.06,
+        headingDeg: this.random() * 360,
+        speedMps: 5 + this.random() * 10,
       });
     });
   }
 
   onApplicationBootstrap() {
-    this.connection = connect([this.config.amqpUrl], { reconnectTimeInSeconds: 5 });
-    this.connection.on('connect', () => this.logger.log('Connected to RabbitMQ'));
-    this.connection.on('disconnect', ({ err }) =>
-      this.logger.warn(`Disconnected from RabbitMQ: ${err?.message ?? 'unknown reason'}`),
-    );
-
-    this.channel = this.connection.createChannel({
-      json: false,
-      setup: (channel: Channel) => assertTopology(channel),
-    });
-
     this.timer = setInterval(() => void this.publishAll(), this.config.publishIntervalMs);
     this.logger.log(
-      `Simulating ${this.vehicles.length} vehicles, one batch each every ${this.config.publishIntervalMs} ms`,
+      `Simulating ${this.vehicles.length} vehicles over ${this.config.transport}, ` +
+        `one batch each every ${this.config.publishIntervalMs} ms`,
     );
   }
 
   buildMessage(vehicle: SimulatedVehicle, now = new Date()): TelemetryMessage {
     const intervalMs = Math.floor(this.config.publishIntervalMs / this.config.readingsPerBatch);
+    let readings = vehicle.sampleBatch(this.config.readingsPerBatch, intervalMs);
+
+    const anomaly = maybeAnomaly(this.config.anomalyRate, this.random);
+    if (anomaly) {
+      readings = injectAnomaly(readings, anomaly);
+      this.logger.log(`Injected ${anomaly} into the next batch from ${vehicle.deviceId}`);
+    }
+
     return {
       messageId: randomUUID(),
       deviceId: vehicle.deviceId,
       recordedAt: now.toISOString(),
-      readings: vehicle.sampleBatch(this.config.readingsPerBatch, intervalMs),
+      readings,
     };
   }
 
-  private async publishAll(): Promise<void> {
-    const channel = this.channel;
-    if (!channel) return;
-
+  async publishAll(): Promise<void> {
     await Promise.all(
-      this.vehicles.map(async (vehicle) => {
+      this.vehicles.map(async (vehicle, index) => {
+        const publisher = this.publisherFor(index);
         const message = this.buildMessage(vehicle);
         try {
-          await channel.publish(
-            TELEMETRY_EXCHANGE,
-            routingKeyFor(vehicle.deviceId),
-            Buffer.from(JSON.stringify(message)),
-            {
-              persistent: true,
-              contentType: 'application/json',
-              messageId: message.messageId,
-              timestamp: Math.floor(Date.now() / 1000),
-            },
-          );
+          await publisher.publish(message);
           this.logger.debug(`Published ${message.messageId} for ${vehicle.deviceId}`);
         } catch (error) {
           this.logger.error(
-            `Publish failed for ${vehicle.deviceId}: ${error instanceof Error ? error.message : String(error)}`,
+            `${publisher.name} publish failed for ${vehicle.deviceId}: ` +
+              (error instanceof Error ? error.message : String(error)),
           );
         }
       }),
     );
   }
 
+  private publisherFor(index: number): TelemetryPublisher {
+    const transport = transportFor(this.config, index);
+    let publisher = this.publishers.get(transport);
+    if (!publisher) {
+      publisher = this.createPublisher(transport, this.config);
+      this.publishers.set(transport, publisher);
+    }
+    return publisher;
+  }
+
   async onApplicationShutdown() {
     if (this.timer) clearInterval(this.timer);
-    await this.channel?.close();
-    await this.connection?.close();
+    await Promise.all([...this.publishers.values()].map((p) => p.close()));
   }
 }
